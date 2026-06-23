@@ -1,0 +1,222 @@
+name: SecureGate AI Security Gate
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  securegate-security-check:
+    runs-on: ubuntu-latest
+
+    env:
+      SECUREGATE_URL: ${{ secrets.SECUREGATE_URL }}
+      SECUREGATE_API_KEY: ${{ secrets.SECUREGATE_API_KEY }}
+
+      # Optional Jenkins trigger secrets
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      JENKINS_JOB: ${{ secrets.JENKINS_JOB }}
+      JENKINS_USER: ${{ secrets.JENKINS_USER }}
+      JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+      SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start SecureGate AI scan
+        id: securegate_start
+        run: |
+          RESPONSE=$(curl -fsS -X POST "$SECUREGATE_URL/api/v1/pipeline/start" \
+            -H "Authorization: Bearer $SECUREGATE_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"project_name\":\"${{ github.event.repository.name }}\",
+              \"repository_url\":\"${{ github.server_url }}/${{ github.repository }}\",
+              \"branch\":\"${{ github.ref_name }}\",
+              \"commit_sha\":\"${{ github.sha }}\",
+              \"pipeline_run_id\":\"${{ github.run_id }}\"
+            }")
+
+          echo "$RESPONSE"
+          SCAN_ID=$(echo "$RESPONSE" | jq -r .scan_id)
+
+          if [ -z "$SCAN_ID" ] || [ "$SCAN_ID" = "null" ]; then
+            echo "SecureGate AI did not return a scan_id"
+            exit 1
+          fi
+
+          echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Run GitLeaks secret scan
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" \
+            zricethezav/gitleaks:latest detect \
+            --source=/repo \
+            --report-format=json \
+            --report-path=/repo/gitleaks-report.json \
+            --no-git || true
+
+          if [ ! -f gitleaks-report.json ]; then
+            echo "[]" > gitleaks-report.json
+          fi
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-fs-report.json
+          exit-code: 0
+
+      - name: Ensure Trivy filesystem report exists
+        run: |
+          if [ ! -f trivy-fs-report.json ]; then
+            echo '{"Results":[]}' > trivy-fs-report.json
+          fi
+
+      - name: Create Trivy image placeholder report
+        run: |
+          cat > trivy-image-report.json <<EOF
+          {
+            "SchemaVersion": 2,
+            "ArtifactName": "image-built-later-by-jenkins",
+            "ArtifactType": "container_image",
+            "Results": []
+          }
+          EOF
+
+      - name: Run SonarQube scan
+        if: env.SONAR_HOST_URL != '' && env.SONAR_TOKEN != '' && env.SONAR_PROJECT_KEY != '' && env.SONAR_ORGANIZATION != ''
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.sources=.
+
+      - name: Fetch SonarQube quality gate and issues
+        if: env.SONAR_HOST_URL != '' && env.SONAR_TOKEN != '' && env.SONAR_PROJECT_KEY != '' && env.SONAR_ORGANIZATION != ''
+        run: |
+          curl -sS -u "$SONAR_TOKEN:"             "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION"             -o sonar-gate.json
+
+          curl -sS -u "$SONAR_TOKEN:"             "$SONAR_HOST_URL/api/issues/search?componentKeys=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION&resolved=false&ps=500"             -o sonar-issues.json
+
+          jq -n             --slurpfile gate sonar-gate.json             --slurpfile issues sonar-issues.json             '{projectStatus: $gate[0].projectStatus, issues: ($issues[0].issues // [])}'             > sonarqube-report.json
+
+          cat sonarqube-report.json
+
+      - name: Create SonarQube placeholder report
+        if: env.SONAR_HOST_URL == '' || env.SONAR_TOKEN == '' || env.SONAR_PROJECT_KEY == '' || env.SONAR_ORGANIZATION == ''
+        run: |
+          cat > sonarqube-report.json <<EOF
+          {
+            "projectStatus": {
+              "status": "UNKNOWN"
+            },
+            "issues": []
+          }
+          EOF
+
+      - name: Upload GitLeaks report
+        run: |
+          curl -fsS -X POST "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/gitleaks" \
+            -H "Authorization: Bearer $SECUREGATE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @gitleaks-report.json
+
+      - name: Upload Trivy filesystem report
+        run: |
+          curl -fsS -X POST "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-fs" \
+            -H "Authorization: Bearer $SECUREGATE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @trivy-fs-report.json
+
+      - name: Upload Trivy image placeholder report
+        run: |
+          curl -fsS -X POST "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-image" \
+            -H "Authorization: Bearer $SECUREGATE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @trivy-image-report.json
+
+      - name: Upload SonarQube report
+        run: |
+          curl -fsS -X POST "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/sonarqube" \
+            -H "Authorization: Bearer $SECUREGATE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @sonarqube-report.json
+
+      - name: Check SecureGate AI deployment decision
+        id: securegate_decision
+        run: |
+          RESPONSE=$(curl -fsS "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}")
+          echo "$RESPONSE"
+
+          DECISION=$(echo "$RESPONSE" | jq -r .deployment_decision)
+          SCORE=$(echo "$RESPONSE" | jq -r .security_score)
+          SONAR_GATE=$(echo "$RESPONSE" | jq -r .sonar_quality_gate)
+          FINDING_COUNTS=$(echo "$RESPONSE" | jq -c .finding_counts)
+          TOOL_STATUS=$(echo "$RESPONSE" | jq -c .tool_status)
+
+          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+
+          echo "SecureGate AI Decision: $DECISION"
+          echo "Security Score: $SCORE"
+          echo "SonarQube Gate: $SONAR_GATE"
+          echo "Finding Counts: $FINDING_COUNTS"
+          echo "Tool Status: $TOOL_STATUS"
+
+          if [ "$DECISION" != "APPROVED" ]; then
+            echo "SecureGate AI rejected this build."
+            if [ "$SONAR_GATE" != "OK" ] && [ "$SONAR_GATE" != "UNKNOWN" ]; then
+              echo "Rejection reason: SonarQube quality gate is $SONAR_GATE. Check SonarCloud Quality Gate conditions."
+            fi
+            exit 1
+          fi
+
+          echo "SecureGate AI approved this build."
+
+      - name: Trigger Jenkins Docker build and Docker Hub push
+        if: steps.securegate_decision.outputs.decision == 'APPROVED'
+        run: |
+          if [ -z "$JENKINS_URL" ] || [ -z "$JENKINS_JOB" ] || [ -z "$JENKINS_USER" ] || [ -z "$JENKINS_API_TOKEN" ]; then
+            echo "Jenkins secrets are not configured."
+            echo "SecureGate AI approved the code. It is ready for Jenkins Docker build and Docker Hub push."
+            exit 0
+          fi
+
+          curl -fsS -X POST "$JENKINS_URL/job/$JENKINS_JOB/buildWithParameters" \
+            --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            --data-urlencode "REPOSITORY_URL=${{ github.server_url }}/${{ github.repository }}" \
+            --data-urlencode "BRANCH=${{ github.ref_name }}" \
+            --data-urlencode "COMMIT_SHA=${{ github.sha }}" \
+            --data-urlencode "SCAN_ID=${{ steps.securegate_start.outputs.scan_id }}"
+
+          echo "Jenkins pipeline triggered successfully."
+
+      - name: Complete SecureGate AI pipeline
+        if: always() && steps.securegate_start.outputs.scan_id != ''
+        run: |
+          STATUS="SUCCESS"
+
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS="FAILED"
+          fi
+
+          curl -fsS -X POST "$SECUREGATE_URL/api/v1/pipeline/complete" \
+            -H "Authorization: Bearer $SECUREGATE_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"scan_id\":\"${{ steps.securegate_start.outputs.scan_id }}\",
+              \"status\":\"$STATUS\"
+            }"

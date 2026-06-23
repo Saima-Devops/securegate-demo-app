@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+
+# FastAPI / local runtime
+*.log
+logs/
+
+# Test/build artifacts
+dist/
+build/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Security scan outputs
+gitleaks-report.json
+trivy-fs-report.json
+trivy-image-report.json
+sonarqube-report.json
+
+env_example.txt
