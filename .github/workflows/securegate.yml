@@ -107,9 +107,9 @@ jobs:
       - name: Fetch SonarQube quality gate and issues
         if: env.SONAR_HOST_URL != '' && env.SONAR_TOKEN != '' && env.SONAR_PROJECT_KEY != '' && env.SONAR_ORGANIZATION != ''
         run: |
-          curl -sS -u "$SONAR_TOKEN:"             "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION"             -o sonar-gate.json
+          curl -sS             -H "Authorization: Bearer $SONAR_TOKEN"             "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION"             -o sonar-gate.json
 
-          curl -sS -u "$SONAR_TOKEN:"             "$SONAR_HOST_URL/api/issues/search?componentKeys=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION&resolved=false&ps=500"             -o sonar-issues.json
+          curl -sS             -H "Authorization: Bearer $SONAR_TOKEN"             "$SONAR_HOST_URL/api/issues/search?componentKeys=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION&resolved=false&ps=500"             -o sonar-issues.json
 
           jq -n             --slurpfile gate sonar-gate.json             --slurpfile issues sonar-issues.json             '{projectStatus: $gate[0].projectStatus, issues: ($issues[0].issues // [])}'             > sonarqube-report.json
 
@@ -181,6 +181,8 @@ jobs:
             if [ "$SONAR_GATE" != "OK" ] && [ "$SONAR_GATE" != "UNKNOWN" ]; then
               echo "Rejection reason: SonarQube quality gate is $SONAR_GATE. Check SonarCloud Quality Gate conditions."
             fi
+            echo "Top findings causing/relevant to rejection:"
+            echo "$RESPONSE" | jq -r '.findings[:10][] | "- [\(.tool)] \(.severity) \(.title) in \(.file // "N/A")"'
             exit 1
           fi
 
