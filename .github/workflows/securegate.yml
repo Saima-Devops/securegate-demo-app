@@ -13,25 +13,48 @@ jobs:
     env:
       SECUREGATE_URL: ${{ secrets.SECUREGATE_URL }}
       SECUREGATE_API_KEY: ${{ secrets.SECUREGATE_API_KEY }}
-
-      # Optional Jenkins trigger secrets
-      JENKINS_URL: ${{ secrets.JENKINS_URL }}
-      JENKINS_JOB: ${{ secrets.JENKINS_JOB }}
-      JENKINS_USER: ${{ secrets.JENKINS_USER }}
-      JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
       SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Validate SecureGate AI URL
+        run: |
+          if [ -z "$SECUREGATE_URL" ]; then
+            echo "SECUREGATE_URL GitHub secret is missing."
+            exit 1
+          fi
+
+          if echo "$SECUREGATE_URL" | grep -Eq '\[|\]|\(|\)| '; then
+            echo "SECUREGATE_URL is malformed."
+            echo "Save it as a plain URL only, for example: https://citric-pliable-baggie.ngrok-free.dev"
+            echo "Do not use Markdown format like [https://...](https://...)."
+            exit 1
+          fi
+
+          case "$SECUREGATE_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "SECUREGATE_URL must start with http:// or https://"
+              exit 1
+              ;;
+          esac
 
       - name: Start SecureGate AI scan
         id: securegate_start
         run: |
-          RESPONSE=$(curl -fsS -X POST "$SECUREGATE_URL/api/v1/pipeline/start" \
+          RESPONSE=$(curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/pipeline/start" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             -d "{
@@ -44,12 +67,10 @@ jobs:
 
           echo "$RESPONSE"
           SCAN_ID=$(echo "$RESPONSE" | jq -r .scan_id)
-
           if [ -z "$SCAN_ID" ] || [ "$SCAN_ID" = "null" ]; then
             echo "SecureGate AI did not return a scan_id"
             exit 1
           fi
-
           echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
 
       - name: Run GitLeaks secret scan
@@ -62,9 +83,7 @@ jobs:
             --report-path=/repo/gitleaks-report.json \
             --no-git || true
 
-          if [ ! -f gitleaks-report.json ]; then
-            echo "[]" > gitleaks-report.json
-          fi
+          test -f gitleaks-report.json || echo "[]" > gitleaks-report.json
 
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@master
@@ -77,20 +96,62 @@ jobs:
 
       - name: Ensure Trivy filesystem report exists
         run: |
-          if [ ! -f trivy-fs-report.json ]; then
-            echo '{"Results":[]}' > trivy-fs-report.json
+          test -f trivy-fs-report.json || echo '{"Results":[]}' > trivy-fs-report.json
+
+      - name: Prepare Dockerfile when missing
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "Using repository Dockerfile."
+            exit 0
           fi
 
-      - name: Create Trivy image placeholder report
-        run: |
-          cat > trivy-image-report.json <<EOF
-          {
-            "SchemaVersion": 2,
-            "ArtifactName": "image-built-later-by-jenkins",
-            "ArtifactType": "container_image",
-            "Results": []
-          }
+          echo "No Dockerfile found. Creating a temporary SecureGate AI Dockerfile for image scanning."
+          if [ -f package.json ]; then
+            cat > Dockerfile <<'EOF'
+          FROM node:24-alpine
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm install
+          COPY . .
+          CMD ["npm", "start"]
           EOF
+          elif [ -f requirements.txt ]; then
+            cat > Dockerfile <<'EOF'
+          FROM python:3.12-alpine
+          WORKDIR /app
+          COPY requirements.txt ./
+          RUN pip install --no-cache-dir -r requirements.txt
+          COPY . .
+          CMD ["python", "app.py"]
+          EOF
+          else
+            cat > Dockerfile <<'EOF'
+          FROM alpine:3.20
+          WORKDIR /app
+          COPY . .
+          CMD ["sh", "-c", "ls -la /app && sleep 30"]
+          EOF
+          fi
+
+      - name: Build Docker image for image vulnerability scan
+        id: image_build
+        run: |
+          IMAGE_REPO=$(echo "${DOCKERHUB_USERNAME:-${{ github.repository_owner }}}/${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_REF="$IMAGE_REPO:${{ github.sha }}"
+          docker build -t "$IMAGE_REF" .
+          echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Run Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image_build.outputs.image_ref }}
+          format: json
+          output: trivy-image-report.json
+          exit-code: 0
+
+      - name: Ensure Trivy image report exists
+        run: |
+          test -f trivy-image-report.json || echo '{"Results":[]}' > trivy-image-report.json
 
       - name: Run SonarQube scan
         if: env.SONAR_HOST_URL != '' && env.SONAR_TOKEN != '' && env.SONAR_PROJECT_KEY != '' && env.SONAR_ORGANIZATION != ''
@@ -107,13 +168,21 @@ jobs:
       - name: Fetch SonarQube quality gate and issues
         if: env.SONAR_HOST_URL != '' && env.SONAR_TOKEN != '' && env.SONAR_PROJECT_KEY != '' && env.SONAR_ORGANIZATION != ''
         run: |
-          curl -sS             -H "Authorization: Bearer $SONAR_TOKEN"             "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION"             -o sonar-gate.json
+          curl -sS \
+            -H "Authorization: Bearer $SONAR_TOKEN" \
+            "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION" \
+            -o sonar-gate.json
 
-          curl -sS             -H "Authorization: Bearer $SONAR_TOKEN"             "$SONAR_HOST_URL/api/issues/search?componentKeys=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION&resolved=false&ps=500"             -o sonar-issues.json
+          curl -sS \
+            -H "Authorization: Bearer $SONAR_TOKEN" \
+            "$SONAR_HOST_URL/api/issues/search?componentKeys=$SONAR_PROJECT_KEY&organization=$SONAR_ORGANIZATION&resolved=false&ps=500" \
+            -o sonar-issues.json
 
-          jq -n             --slurpfile gate sonar-gate.json             --slurpfile issues sonar-issues.json             '{projectStatus: $gate[0].projectStatus, issues: ($issues[0].issues // [])}'             > sonarqube-report.json
-
-          cat sonarqube-report.json
+          jq -n \
+            --slurpfile gate sonar-gate.json \
+            --slurpfile issues sonar-issues.json \
+            '{projectStatus: $gate[0].projectStatus, issues: ($issues[0].issues // [])}' \
+            > sonarqube-report.json
 
       - name: Create SonarQube placeholder report
         if: env.SONAR_HOST_URL == '' || env.SONAR_TOKEN == '' || env.SONAR_PROJECT_KEY == '' || env.SONAR_ORGANIZATION == ''
@@ -129,36 +198,35 @@ jobs:
 
       - name: Upload GitLeaks report
         run: |
-          curl -fsS -X POST "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/gitleaks" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/gitleaks" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @gitleaks-report.json
 
       - name: Upload Trivy filesystem report
         run: |
-          curl -fsS -X POST "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-fs" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-fs" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @trivy-fs-report.json
 
-      - name: Upload Trivy image placeholder report
+      - name: Upload Trivy image report
         run: |
-          curl -fsS -X POST "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-image" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-image" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @trivy-image-report.json
 
       - name: Upload SonarQube report
         run: |
-          curl -fsS -X POST "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/sonarqube" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/sonarqube" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @sonarqube-report.json
 
       - name: Check SecureGate AI deployment decision
-        id: securegate_decision
         run: |
-          RESPONSE=$(curl -fsS "$SECUREGATE_URL/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}")
+          RESPONSE=$(curl -fsS "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}")
           echo "$RESPONSE"
 
           DECISION=$(echo "$RESPONSE" | jq -r .deployment_decision)
@@ -166,9 +234,6 @@ jobs:
           SONAR_GATE=$(echo "$RESPONSE" | jq -r .sonar_quality_gate)
           FINDING_COUNTS=$(echo "$RESPONSE" | jq -c .finding_counts)
           TOOL_STATUS=$(echo "$RESPONSE" | jq -c .tool_status)
-
-          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
-          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
 
           echo "SecureGate AI Decision: $DECISION"
           echo "Security Score: $SCORE"
@@ -188,23 +253,14 @@ jobs:
 
           echo "SecureGate AI approved this build."
 
-      - name: Trigger Jenkins Docker build and Docker Hub push
-        if: steps.securegate_decision.outputs.decision == 'APPROVED'
+      - name: Push approved Docker image to Docker Hub when configured
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
         run: |
-          if [ -z "$JENKINS_URL" ] || [ -z "$JENKINS_JOB" ] || [ -z "$JENKINS_USER" ] || [ -z "$JENKINS_API_TOKEN" ]; then
-            echo "Jenkins secrets are not configured."
-            echo "SecureGate AI approved the code. It is ready for Jenkins Docker build and Docker Hub push."
-            exit 0
-          fi
-
-          curl -fsS -X POST "$JENKINS_URL/job/$JENKINS_JOB/buildWithParameters" \
-            --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
-            --data-urlencode "REPOSITORY_URL=${{ github.server_url }}/${{ github.repository }}" \
-            --data-urlencode "BRANCH=${{ github.ref_name }}" \
-            --data-urlencode "COMMIT_SHA=${{ github.sha }}" \
-            --data-urlencode "SCAN_ID=${{ steps.securegate_start.outputs.scan_id }}"
-
-          echo "Jenkins pipeline triggered successfully."
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          docker push "${{ steps.image_build.outputs.image_ref }}"
+          LATEST_REF=$(echo "$DOCKERHUB_USERNAME/${{ github.event.repository.name }}:latest" | tr '[:upper:]' '[:lower:]')
+          docker tag "${{ steps.image_build.outputs.image_ref }}" "$LATEST_REF"
+          docker push "$LATEST_REF"
 
       - name: Complete SecureGate AI pipeline
         if: always() && steps.securegate_start.outputs.scan_id != ''
@@ -215,7 +271,7 @@ jobs:
             STATUS="FAILED"
           fi
 
-          curl -fsS -X POST "$SECUREGATE_URL/api/v1/pipeline/complete" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/pipeline/complete" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             -d "{
