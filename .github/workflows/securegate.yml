@@ -19,6 +19,12 @@ jobs:
       SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      PROJECT_NAME: ${{ github.event.repository.name }}
+      REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+      BRANCH_NAME: ${{ github.ref_name }}
+      COMMIT_SHA: ${{ github.sha }}
+      PIPELINE_RUN_ID: ${{ github.run_id }}
+      REPOSITORY_OWNER: ${{ github.repository_owner }}
 
     steps:
       - name: Checkout repository
@@ -58,11 +64,11 @@ jobs:
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             -d "{
-              \"project_name\":\"${{ github.event.repository.name }}\",
-              \"repository_url\":\"${{ github.server_url }}/${{ github.repository }}\",
-              \"branch\":\"${{ github.ref_name }}\",
-              \"commit_sha\":\"${{ github.sha }}\",
-              \"pipeline_run_id\":\"${{ github.run_id }}\"
+              \"project_name\":\"$PROJECT_NAME\",
+              \"repository_url\":\"$REPOSITORY_URL\",
+              \"branch\":\"$BRANCH_NAME\",
+              \"commit_sha\":\"$COMMIT_SHA\",
+              \"pipeline_run_id\":\"$PIPELINE_RUN_ID\"
             }")
 
           echo "$RESPONSE"
@@ -212,10 +218,10 @@ jobs:
       - name: Build Docker image for image vulnerability scan
         id: image_build
         run: |
-          IMAGE_NAMESPACE="${DOCKERHUB_USERNAME:-${{ github.repository_owner }}}"
-          IMAGE_REPOSITORY="${{ github.event.repository.name }}"
+          IMAGE_NAMESPACE="${DOCKERHUB_USERNAME:-$REPOSITORY_OWNER}"
+          IMAGE_REPOSITORY="$PROJECT_NAME"
           IMAGE_REPO=$(echo "$IMAGE_NAMESPACE/$IMAGE_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          IMAGE_SHA_REF="$IMAGE_REPO:${{ github.sha }}"
+          IMAGE_SHA_REF="$IMAGE_REPO:$COMMIT_SHA"
           IMAGE_LATEST_REF="$IMAGE_REPO:latest"
 
           echo "SecureGate AI Docker image path: $IMAGE_SHA_REF"
@@ -231,8 +237,10 @@ jobs:
       - name: Check Docker Hub image tag freshness
         id: image_freshness
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        env:
+          IMAGE_REF: ${{ steps.image_build.outputs.image_ref }}
         run: |
-          if docker manifest inspect "${{ steps.image_build.outputs.image_ref }}" >/dev/null 2>&1; then
+          if docker manifest inspect "$IMAGE_REF" >/dev/null 2>&1; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Image already exists on Docker Hub for this commit. Push will be skipped."
           else
@@ -253,50 +261,64 @@ jobs:
           test -f trivy-image-report.json || echo '{"Results":[]}' > trivy-image-report.json
 
       - name: Upload GitLeaks report
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
         run: |
-          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/gitleaks" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/$SCAN_ID/gitleaks" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @gitleaks-report.json
 
       - name: Upload Semgrep report
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
         run: |
-          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/semgrep" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/$SCAN_ID/semgrep" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @semgrep-report.json
 
       - name: Upload Trivy filesystem report
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
         run: |
-          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-fs" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/$SCAN_ID/trivy-fs" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @trivy-fs-report.json
 
       - name: Upload Trivy image report
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
         run: |
-          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-image" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/$SCAN_ID/trivy-image" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @trivy-image-report.json
 
       - name: Upload SonarQube report
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
         run: |
-          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/sonarqube" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/$SCAN_ID/sonarqube" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @sonarqube-report.json
 
       - name: Upload unit-test report
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
         run: |
-          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/unit-tests" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/$SCAN_ID/unit-tests" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @unit-tests-report.json
 
       - name: Check SecureGate AI deployment decision
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
         run: |
-          RESPONSE=$(curl -fsS "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}")
+          RESPONSE=$(curl -fsS "${SECUREGATE_URL%/}/api/v1/scans/$SCAN_ID")
           echo "$RESPONSE"
 
           DECISION=$(echo "$RESPONSE" | jq -r .deployment_decision)
@@ -327,13 +349,16 @@ jobs:
 
       - name: Push approved Docker image to Docker Hub when configured
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && steps.image_freshness.outputs.changed == 'true'
+        env:
+          IMAGE_REF: ${{ steps.image_build.outputs.image_ref }}
+          LATEST_REF: ${{ steps.image_build.outputs.latest_ref }}
         run: |
           echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-          docker push "${{ steps.image_build.outputs.image_ref }}"
-          docker push "${{ steps.image_build.outputs.latest_ref }}"
+          docker push "$IMAGE_REF"
+          docker push "$LATEST_REF"
           echo "Docker image pushed to Docker Hub:"
-          echo "  ${{ steps.image_build.outputs.image_ref }}"
-          echo "  ${{ steps.image_build.outputs.latest_ref }}"
+          echo "  $IMAGE_REF"
+          echo "  $LATEST_REF"
 
       - name: Rescan pushed Docker image
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && steps.image_freshness.outputs.changed == 'true'
@@ -346,8 +371,10 @@ jobs:
 
       - name: Upload post-push image rescan to SecureGate AI
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && steps.image_freshness.outputs.changed == 'true'
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
         run: |
-          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-image" \
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/$SCAN_ID/trivy-image" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @trivy-image-report.json
@@ -365,10 +392,13 @@ jobs:
 
       - name: Complete SecureGate AI pipeline
         if: always() && steps.securegate_start.outputs.scan_id != ''
+        env:
+          SCAN_ID: ${{ steps.securegate_start.outputs.scan_id }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           STATUS="SUCCESS"
 
-          if [ "${{ job.status }}" != "success" ]; then
+          if [ "$JOB_STATUS" != "success" ]; then
             STATUS="FAILED"
           fi
 
@@ -376,6 +406,6 @@ jobs:
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             -d "{
-              \"scan_id\":\"${{ steps.securegate_start.outputs.scan_id }}\",
+              \"scan_id\":\"$SCAN_ID\",
               \"status\":\"$STATUS\"
             }"
