@@ -85,6 +85,11 @@ jobs:
 
           test -f gitleaks-report.json || echo "[]" > gitleaks-report.json
 
+      - name: Run Semgrep SAST scan
+        run: |
+          docker run --rm -v "$PWD:/src" returntocorp/semgrep:latest semgrep scan --config auto --json --output /src/semgrep-report.json /src || true
+          test -f semgrep-report.json || echo '{"results":[]}' > semgrep-report.json
+
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -141,6 +146,29 @@ jobs:
             "issues": []
           }
           EOF
+
+      - name: Detect and run unit tests
+        run: |
+          STATUS="SKIPPED"
+          FRAMEWORK="none"
+          REASON="No supported unit test configuration found"
+          TOTAL=0
+          FAILED=0
+
+          if [ -f package.json ] && jq -e '.scripts.test and .scripts.test != ""' package.json >/dev/null 2>&1; then
+            FRAMEWORK="node"
+            if npm test; then STATUS="PASSED"; REASON="Node test script passed"; else STATUS="FAILED"; REASON="Node test script failed"; FAILED=1; fi
+          elif [ -d tests ] || [ -f pytest.ini ] || grep -q "pytest" pyproject.toml setup.cfg 2>/dev/null; then
+            FRAMEWORK="pytest"
+            python -m pip install --upgrade pip >/dev/null 2>&1 || true
+            if [ -f requirements.txt ]; then python -m pip install -r requirements.txt >/dev/null 2>&1 || true; fi
+            if [ -f requirements-dev.txt ]; then python -m pip install -r requirements-dev.txt >/dev/null 2>&1 || true; fi
+            python -m pip install pytest >/dev/null 2>&1 || true
+            if python -m pytest; then STATUS="PASSED"; REASON="pytest passed"; else STATUS="FAILED"; REASON="pytest failed"; FAILED=1; fi
+          fi
+
+          jq -n --arg status "$STATUS" --arg framework "$FRAMEWORK" --arg reason "$REASON" --argjson total "$TOTAL" --argjson failed "$FAILED" \
+            '{status:$status, framework:$framework, reason:$reason, total:$total, failed:$failed}' > unit-tests-report.json
 
       - name: Prepare Dockerfile when missing
         id: dockerfile
@@ -200,6 +228,18 @@ jobs:
           echo "latest_ref=$IMAGE_LATEST_REF" >> "$GITHUB_OUTPUT"
           echo "image_repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
 
+      - name: Check Docker Hub image tag freshness
+        id: image_freshness
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        run: |
+          if docker manifest inspect "${{ steps.image_build.outputs.image_ref }}" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Image already exists on Docker Hub for this commit. Push will be skipped."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No existing Docker Hub image found for this commit. Push is needed."
+          fi
+
       - name: Run Trivy image scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -218,6 +258,13 @@ jobs:
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @gitleaks-report.json
+
+      - name: Upload Semgrep report
+        run: |
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/semgrep" \
+            -H "Authorization: Bearer $SECUREGATE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @semgrep-report.json
 
       - name: Upload Trivy filesystem report
         run: |
@@ -239,6 +286,13 @@ jobs:
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @sonarqube-report.json
+
+      - name: Upload unit-test report
+        run: |
+          curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/unit-tests" \
+            -H "Authorization: Bearer $SECUREGATE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @unit-tests-report.json
 
       - name: Check SecureGate AI deployment decision
         run: |
@@ -272,7 +326,7 @@ jobs:
           echo "Repository, filesystem, image, secrets, and Sonar quality checks passed SecureGate AI policy."
 
       - name: Push approved Docker image to Docker Hub when configured
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && steps.image_freshness.outputs.changed == 'true'
         run: |
           echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
           docker push "${{ steps.image_build.outputs.image_ref }}"
@@ -282,7 +336,7 @@ jobs:
           echo "  ${{ steps.image_build.outputs.latest_ref }}"
 
       - name: Rescan pushed Docker image
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && steps.image_freshness.outputs.changed == 'true'
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ steps.image_build.outputs.image_ref }}
@@ -291,13 +345,18 @@ jobs:
           exit-code: 0
 
       - name: Upload post-push image rescan to SecureGate AI
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && steps.image_freshness.outputs.changed == 'true'
         run: |
           curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/scans/${{ steps.securegate_start.outputs.scan_id }}/trivy-image" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
             --data-binary @trivy-image-report.json
           echo "Pushed Docker image was rescanned and SecureGate AI dashboard was updated."
+
+      - name: Docker Hub image unchanged
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && steps.image_freshness.outputs.changed == 'false'
+        run: |
+          echo "SecureGate AI approved this build, but Docker Hub push was skipped because this commit image already exists."
 
       - name: Docker Hub push not configured
         if: env.DOCKERHUB_USERNAME == '' || env.DOCKERHUB_TOKEN == ''
