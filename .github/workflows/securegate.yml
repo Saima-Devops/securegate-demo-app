@@ -22,13 +22,18 @@ jobs:
       PROJECT_NAME: ${{ github.event.repository.name }}
       REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
       BRANCH_NAME: ${{ github.ref_name }}
-      COMMIT_SHA: ${{ github.sha }}
       PIPELINE_RUN_ID: ${{ github.run_id }}
       REPOSITORY_OWNER: ${{ github.repository_owner }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Detect current commit SHA
+        run: |
+          CURRENT_COMMIT_SHA=$(git rev-parse HEAD)
+          echo "COMMIT_SHA=$CURRENT_COMMIT_SHA" >> "$GITHUB_ENV"
+          echo "Current commit SHA: $CURRENT_COMMIT_SHA"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v5
@@ -60,18 +65,35 @@ jobs:
       - name: Start SecureGate AI scan
         id: securegate_start
         run: |
-          RESPONSE=$(curl -fsS -X POST "${SECUREGATE_URL%/}/api/v1/pipeline/start" \
+          if echo "$REPOSITORY_URL" | grep -Eq '\[|\]|\(|\)'; then
+            echo "REPOSITORY_URL is malformed. It must be a plain URL, not a Markdown link: $REPOSITORY_URL"
+            exit 1
+          fi
+
+          START_PAYLOAD=$(jq -nc \
+            --arg project_name "$PROJECT_NAME" \
+            --arg repository_url "$REPOSITORY_URL" \
+            --arg branch "$BRANCH_NAME" \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg pipeline_run_id "$PIPELINE_RUN_ID" \
+            '{project_name:$project_name, repository_url:$repository_url, branch:$branch, commit_sha:$commit_sha, pipeline_run_id:$pipeline_run_id}')
+
+          echo "SecureGate start payload:"
+          echo "$START_PAYLOAD" | jq .
+
+          HTTP_STATUS=$(curl -sS -o securegate-start-response.json -w "%{http_code}" -X POST "${SECUREGATE_URL%/}/api/v1/pipeline/start" \
             -H "Authorization: Bearer $SECUREGATE_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"project_name\":\"$PROJECT_NAME\",
-              \"repository_url\":\"$REPOSITORY_URL\",
-              \"branch\":\"$BRANCH_NAME\",
-              \"commit_sha\":\"$COMMIT_SHA\",
-              \"pipeline_run_id\":\"$PIPELINE_RUN_ID\"
-            }")
+            --data "$START_PAYLOAD")
 
-          echo "$RESPONSE"
+          echo "SecureGate start response status: $HTTP_STATUS"
+          cat securegate-start-response.json
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "SecureGate AI rejected the pipeline start request. Check the validation details above."
+            exit 1
+          fi
+
+          RESPONSE=$(cat securegate-start-response.json)
           SCAN_ID=$(echo "$RESPONSE" | jq -r .scan_id)
           if [ -z "$SCAN_ID" ] || [ "$SCAN_ID" = "null" ]; then
             echo "SecureGate AI did not return a scan_id"
